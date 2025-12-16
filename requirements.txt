@@ -1,0 +1,20 @@
+# Agent Framework (Preview - requires --pre flag)
+agent-framework-azure-ai
+
+# Azure Services
+azure-ai-documentintelligence
+openai
+
+# PDF Processing
+pypdf
+pdfplumber
+
+# Data Processing
+python-dotenv
+pydantic
+pandas
+tabulate
+
+# Utilities
+tqdm
+colorama
