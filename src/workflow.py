@@ -24,12 +24,13 @@ class PDFComparisonWorkflow:
         """
         self.config = config
         
-        # Initialize Azure OpenAI chat client
+        # Initialize Azure OpenAI chat client with temperature=0.0 for deterministic results
         self.chat_client = AzureOpenAIChatClient(
             endpoint=config.azure_openai.endpoint,
             credential=AzureKeyCredential(config.azure_openai.api_key),
             deployment_name=config.azure_openai.deployment_name,
-            api_version=config.azure_openai.api_version
+            api_version=config.azure_openai.api_version,
+            temperature=0.0
         )
         
         # Initialize PDF extractor

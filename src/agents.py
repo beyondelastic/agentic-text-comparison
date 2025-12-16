@@ -98,8 +98,9 @@ Be thorough and accurate - this data will be used for detailed comparison."""
 class PDFComparisonAgent(Executor):
     """Agent responsible for comparing two PDF extractions and finding differences.
     
-    This agent performs intelligent, word-level comparison of the extracted content
-    and identifies all differences between the two documents.
+    This agent uses a hybrid two-phase approach:
+    Phase 1: Deterministic diff algorithm finds ALL differences (free, fast)
+    Phase 2: LLM adds semantic context and meaning to each difference (cost-effective)
     """
     
     def __init__(
@@ -113,44 +114,42 @@ class PDFComparisonAgent(Executor):
             chat_client: Azure OpenAI chat client
             id: Executor ID
         """
+        # Import diff tool here to avoid circular imports
+        from .diff_tool import TextDiffer
+        
+        self.diff_tool = TextDiffer(similarity_threshold=0.6)
+        
         self.agent = chat_client.create_agent(
-            instructions="""You are an expert document comparison specialist for pharmaceutical and regulatory documents.
+            instructions="""You are an expert document analysis specialist for pharmaceutical and regulatory documents.
 
-Your task is to perform a thorough, word-by-word comparison of two PDF documents and identify ALL differences.
+Your task is to provide semantic context and meaning for text differences that have already been identified.
 
-Instructions:
-1. Compare the documents section by section, page by page
-2. Identify three types of differences:
-   - "added": Content present in document 2 but not in document 1
-   - "removed": Content present in document 1 but not in document 2
-   - "modified": Content that exists in both but has been changed
+You will receive a list of differences found by a diff algorithm. For each difference, provide:
 
-3. For each difference, provide:
-   - Page number where the difference occurs
-   - Section name
-   - The original text (from document 1)
-   - The new text (from document 2)
-   - Brief context (surrounding text)
+1. **Context**: Explain where this change appears (what section, what topic)
+2. **Semantic meaning**: What does this change mean? Why might it be important?
+3. **Impact assessment**: Is this a minor change (typo, formatting) or major (content, meaning)?
 
-4. Be thorough - catch even small differences like:
-   - Word changes
-   - Number changes
-   - Punctuation differences
-   - Formatting differences that affect meaning
+Input format: You'll receive differences like:
+- Type: added/removed/modified
+- Page number
+- Section title
+- Original text
+- New text
 
-5. Output format: Return a JSON array of differences with this structure:
-   [
-     {
-       "page_number": 1,
-       "section": "Section name",
-       "difference_type": "modified",
-       "original_text": "original wording",
-       "new_text": "new wording",
-       "context": "surrounding text for reference"
-     }
-   ]
+Output format: Return a JSON array with the SAME differences plus added context:
+[
+  {
+    "page_number": 1,
+    "section": "Introduction",
+    "difference_type": "modified",
+    "original_text": "version 1.0",
+    "new_text": "version 2.0",
+    "context": "Version number updated in the document header. This indicates a major revision."
+  }
+]
 
-Be precise, thorough, and focus on substantive differences that matter for document comparison."""
+Be concise but informative. Focus on WHY the change matters, not just WHAT changed."""
         )
         super().__init__(id=id)
     
@@ -160,7 +159,10 @@ Be precise, thorough, and focus on substantive differences that matter for docum
         extractions: tuple[PDFExtraction, PDFExtraction],
         ctx: WorkflowContext[Never, ComparisonResult]
     ) -> None:
-        """Compare two PDF extractions and find all differences.
+        """Compare two PDF extractions using a hybrid two-phase approach.
+        
+        Phase 1: Use diff algorithm to find ALL differences (deterministic, free)
+        Phase 2: Use LLM to add semantic context (cost-effective, only for diffs)
         
         Args:
             extractions: Tuple containing two PDF extractions
@@ -169,113 +171,173 @@ Be precise, thorough, and focus on substantive differences that matter for docum
         extraction1, extraction2 = extractions
         
         print(f"\n{'='*60}")
-        print("STEP 2: Comparing Documents with AI")
+        print("STEP 2: Comparing Documents (Hybrid Approach)")
         print(f"{'='*60}")
         print(f"Comparing: {extraction1.filename} vs {extraction2.filename}")
         
-        # Prepare the comparison prompt with both documents
-        comparison_prompt = self._build_comparison_prompt(extraction1, extraction2)
+        # PHASE 1: Deterministic diff (no AI cost)
+        print("\nPhase 1: Running deterministic diff algorithm...")
+        raw_differences = self.diff_tool.compare_extractions(extraction1, extraction2)
+        print(f"✓ Found {len(raw_differences)} differences using diff algorithm")
+        print(f"  - Added: {sum(1 for d in raw_differences if d.difference_type == 'added')}")
+        print(f"  - Removed: {sum(1 for d in raw_differences if d.difference_type == 'removed')}")
+        print(f"  - Modified: {sum(1 for d in raw_differences if d.difference_type == 'modified')}")
         
-        # Create chat message and run the agent
-        message = ChatMessage(Role.USER, text=comparison_prompt)
-        response = await self.agent.run([message])
+        if not raw_differences:
+            print("\n✓ No differences found - documents are identical!")
+            result = ComparisonResult(
+                pdf1_name=extraction1.filename,
+                pdf2_name=extraction2.filename,
+                differences=[],
+                total_differences=0
+            )
+            await ctx.yield_output(result)
+            return
         
-        # Parse the agent's response to extract differences
-        differences = self._parse_comparison_response(response.text)
+        # PHASE 2: LLM enhancement (only for differences found)
+        print(f"\nPhase 2: Adding semantic context with AI (processing {len(raw_differences)} differences)...")
+        enhanced_differences = await self._enhance_differences_with_llm(raw_differences)
         
         # Create comparison result
         result = ComparisonResult(
             pdf1_name=extraction1.filename,
             pdf2_name=extraction2.filename,
-            differences=differences,
-            total_differences=len(differences)
+            differences=enhanced_differences,
+            total_differences=len(enhanced_differences)
         )
         
-        print(f"\n✓ Found {len(differences)} differences")
-        print(f"  - Added: {sum(1 for d in differences if d.difference_type == 'added')}")
-        print(f"  - Removed: {sum(1 for d in differences if d.difference_type == 'removed')}")
-        print(f"  - Modified: {sum(1 for d in differences if d.difference_type == 'modified')}")
+        print(f"\n✓ Comparison complete with AI-enhanced context")
         
         # Yield the final result
         await ctx.yield_output(result)
     
-    def _build_comparison_prompt(
+    async def _enhance_differences_with_llm(
         self,
-        extraction1: PDFExtraction,
-        extraction2: PDFExtraction
-    ) -> str:
-        """Build a comprehensive prompt for the comparison agent.
+        raw_differences: list
+    ) -> list[TextDifference]:
+        """Enhance raw differences with semantic context using LLM.
+        
+        This sends only the differences (not full documents) to the LLM
+        for context enhancement, dramatically reducing token usage.
         
         Args:
-            extraction1: First PDF extraction
-            extraction2: Second PDF extraction
+            raw_differences: List of RawDifference objects from diff algorithm
+            
+        Returns:
+            List of TextDifference objects with AI-generated context
+        """
+        # Group differences for efficient batch processing
+        grouped_diffs = self.diff_tool.group_related_differences(raw_differences, max_distance=5)
+        
+        enhanced_differences = []
+        total_groups = len(grouped_diffs)
+        
+        for idx, diff_group in enumerate(grouped_diffs, 1):
+            print(f"  Processing group {idx}/{total_groups} ({len(diff_group)} differences)...")
+            
+            # Build prompt with just these differences
+            prompt = self._build_enhancement_prompt(diff_group)
+            
+            # Send to LLM
+            message = ChatMessage(Role.USER, text=prompt)
+            response = await self.agent.run([message])
+            
+            # Parse response
+            enhanced = self._parse_enhancement_response(response.text, diff_group)
+            enhanced_differences.extend(enhanced)
+        
+        return enhanced_differences
+    
+    def _build_enhancement_prompt(self, diff_group: list) -> str:
+        """Build a prompt for LLM to enhance a group of differences.
+        
+        Args:
+            diff_group: List of RawDifference objects
             
         Returns:
             Formatted prompt string
         """
-        prompt = f"""Compare these two documents and identify ALL differences:
+        prompt = """Please provide semantic context for these differences found in the document:
 
-DOCUMENT 1: {extraction1.filename}
-Total pages: {extraction1.total_pages}
-Content:
 """
         
-        # Add sections from document 1
-        for section in extraction1.sections[:50]:  # Limit to first 50 sections for token management
-            prompt += f"\n[Page {section.page_number}, {section.section_title}]\n{section.content}\n"
+        for i, diff in enumerate(diff_group, 1):
+            prompt += f"""{i}. [{diff.difference_type.upper()}] Page {diff.page_number}, {diff.section_title}
+   Original: "{diff.original_text}"
+   New: "{diff.new_text}"
+
+"""
         
-        prompt += f"\n\nDOCUMENT 2: {extraction2.filename}\nTotal pages: {extraction2.total_pages}\nContent:\n"
-        
-        # Add sections from document 2
-        for section in extraction2.sections[:50]:
-            prompt += f"\n[Page {section.page_number}, {section.section_title}]\n{section.content}\n"
-        
-        prompt += """\n\nNow perform a detailed comparison and return a JSON array of all differences found.
-Use the exact format specified in your instructions."""
+        prompt += """For each difference, provide context explaining:
+- Where this appears in the document
+- What this change means
+- Why it might be important
+
+Return as JSON array matching the format in your instructions."""
         
         return prompt
     
-    def _parse_comparison_response(self, response_text: str) -> list[TextDifference]:
-        """Parse the agent's response and extract differences.
+    def _parse_enhancement_response(
+        self,
+        response_text: str,
+        diff_group: list
+    ) -> list[TextDifference]:
+        """Parse LLM response and combine with raw differences.
         
         Args:
-            response_text: The agent's response text
+            response_text: LLM response text
+            diff_group: Original RawDifference objects
             
         Returns:
-            List of TextDifference objects
+            List of TextDifference objects with context
         """
         differences = []
         
         try:
-            # Try to extract JSON from the response
-            # The response might contain explanation text, so find the JSON array
+            # Try to extract JSON from response
             json_start = response_text.find('[')
             json_end = response_text.rfind(']') + 1
             
             if json_start >= 0 and json_end > json_start:
                 json_str = response_text[json_start:json_end]
-                diff_data = json.loads(json_str)
+                enhanced_data = json.loads(json_str)
                 
-                # Convert to TextDifference objects
-                for item in diff_data:
+                # Match enhanced data with raw differences
+                for i, item in enumerate(enhanced_data):
+                    # Get corresponding raw diff (fallback if mismatch)
+                    raw_diff = diff_group[i] if i < len(diff_group) else diff_group[0]
+                    
                     differences.append(TextDifference(
-                        page_number=item.get("page_number", 0),
-                        section=item.get("section", "Unknown"),
-                        difference_type=item.get("difference_type", "modified"),
-                        original_text=item.get("original_text", ""),
-                        new_text=item.get("new_text", ""),
-                        context=item.get("context", "")
+                        page_number=item.get("page_number", raw_diff.page_number),
+                        section=item.get("section", raw_diff.section_title),
+                        difference_type=item.get("difference_type", raw_diff.difference_type),
+                        original_text=item.get("original_text", raw_diff.original_text),
+                        new_text=item.get("new_text", raw_diff.new_text),
+                        context=item.get("context", "No context provided")
                     ))
+            else:
+                # Fallback: use raw differences with generic context
+                for raw_diff in diff_group:
+                    differences.append(TextDifference(
+                        page_number=raw_diff.page_number,
+                        section=raw_diff.section_title,
+                        difference_type=raw_diff.difference_type,
+                        original_text=raw_diff.original_text,
+                        new_text=raw_diff.new_text,
+                        context=f"Found on page {raw_diff.page_number} in {raw_diff.section_title}"
+                    ))
+        
         except json.JSONDecodeError:
-            print("⚠ Warning: Could not parse JSON from agent response")
-            # Fallback: create a single difference with the full response
-            differences.append(TextDifference(
-                page_number=0,
-                section="Analysis",
-                difference_type="modified",
-                original_text="See full analysis",
-                new_text=response_text[:500],  # First 500 chars
-                context="Agent provided non-JSON response"
-            ))
+            print("  ⚠ Warning: Could not parse LLM response, using raw differences")
+            # Fallback to raw differences with basic context
+            for raw_diff in diff_group:
+                differences.append(TextDifference(
+                    page_number=raw_diff.page_number,
+                    section=raw_diff.section_title,
+                    difference_type=raw_diff.difference_type,
+                    original_text=raw_diff.original_text,
+                    new_text=raw_diff.new_text,
+                    context=f"Found on page {raw_diff.page_number}"
+                ))
         
         return differences
